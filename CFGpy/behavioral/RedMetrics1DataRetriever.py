@@ -4,7 +4,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
-
+from datetime import datetime
 import pandas as pd
 import requests
 
@@ -14,7 +14,6 @@ from CFGpy.behavioral._consts import (DATA_RETRIEVER_OUTPUT_FILENAME, CONFIG_URL
 try:
     from CFGpy.utils._nas_path import get_nas_path
 except ImportError:
-    # Fallback for users who don't have the internal NAS utility
     def get_nas_path():
         return ""
 
@@ -25,27 +24,16 @@ class RedMetrics1DataRetriever(DataRetriever):
                  output_filename: str = DATA_RETRIEVER_OUTPUT_FILENAME,
                  config: Configuration = None, csv_directory: str = None,
                  input_url: str = None) -> None:
-        """
-        :param game_name: The game name (optional metadata).
-        :param game_id: The game id (optional metadata).
-        :param output_filename: filename for output.
-        :param config: a Configuration file.
-        :param csv_directory: Directory containing the CSV files (events.csv, players.csv).
-        :param input_url: URL input to get the data from the RM1 API.
-        """
         super().__init__(game_name=game_name, game_id=game_id, output_filename=output_filename,
                          config=config if config is not None else Configuration.default(is_rm1=True))
 
         self._game_version_ids = self._config.GAME_VERSION_IDS or game_version_ids
 
-        # Mode A: URL provided
         if input_url:
             print(f"Initializing retrieval from URL: {input_url}...")
-            # Download data and get metadata
             downloaded_meta = self._download_and_cache(input_url)
             self._csv_directory = Path(downloaded_meta['csv_directory'])
 
-            # If game_id/name were not provided in CLI, use what we found in the URL/CSV
             if not self._game_id:
                 self._game_id = downloaded_meta['game_id']
                 self._config.GAME_ID = self._game_id
@@ -53,21 +41,15 @@ class RedMetrics1DataRetriever(DataRetriever):
                 self._game_name = downloaded_meta['game_name']
                 self._config.GAME_NAME = self._game_name
 
-        # Mode B: Folder provided explicitly
         elif csv_directory:
             self._csv_directory = Path(csv_directory)
-
-        # Mode C: Legacy NAS (Construct path dynamically)
         else:
             try:
                 self.nas_path = get_nas_path()
-                self.csv_path = os.path.join(self.nas_path, "Projects", "CFG", "all_data_from_aws",
-                                             "redmetrics")
+                self.csv_path = os.path.join(self.nas_path, "Projects", "CFG", "all_data_from_aws", "redmetrics")
                 self._csv_directory = Path(self.csv_path)
             except Exception as e:
-                # Fail gracefully if neither is available
-                raise FileNotFoundError(
-                    f"Could not determine NAS path and no csv_directory provided. Error: {e}")
+                raise FileNotFoundError(f"Could not determine NAS path. Error: {e}")
 
         if not self._csv_directory.exists():
             raise FileNotFoundError(f"The CSV directory does not exist: {self._csv_directory}")
@@ -77,99 +59,116 @@ class RedMetrics1DataRetriever(DataRetriever):
         self._load_csv_files()
 
     def _download_and_cache(self, url: str, target_directory: str = "downloaded_data_cache") -> dict:
-        """
-        Downloads content from URL and synthesizes necessary CSV files (events, games, players, versions).
-        Returns dictionary with extracted game_id, game_name, and the directory path.
-        """
         parsed_url = urlparse(url)
         query_params = parse_qs(parsed_url.query)
         os.makedirs(target_directory, exist_ok=True)
-
-        # A. Download
-        print(f"Downloading data...")
-        response = requests.get(url)
-        response.raise_for_status()
-        csv_content = response.text
-
-        # B. Save events.csv
         events_path = os.path.join(target_directory, "events.csv")
-        with open(events_path, "w", encoding="utf-8") as f:
-            f.write(csv_content)
 
-        # C. Load for processing
-        df_events = pd.read_csv(StringIO(csv_content))
+        # 1. Seamless Chunked Download
+        after_str = query_params.get('after', ["2021-01-01T00:00:00.000Z"])[0]
+        current_after_dt = pd.to_datetime(after_str.replace('Z', ''))
+        end_dt = datetime.now()
+        base_url_no_params = url.split('?')[0]
+        game_id_from_url = query_params.get('game', [None])[0]
 
-        # D. Extract ID/Name
+        print(f"Downloading 5-year data in 30-day chunks...")
+        chunk_dfs = []
+
+        while current_after_dt < end_dt:
+            next_before_dt = current_after_dt + pd.Timedelta(days=30)
+            if next_before_dt > end_dt: next_before_dt = end_dt
+
+            after_val = current_after_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            before_val = next_before_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            chunk_url = f"{base_url_no_params}?game={game_id_from_url}&entityType=event&after={after_val}&before={before_val}"
+
+            try:
+                res = requests.get(chunk_url, timeout=(10, 120))
+                res.raise_for_status()
+                # Use 'skip' for bad lines (like the 1dd line)
+                tmp = pd.read_csv(StringIO(res.text), on_bad_lines='skip')
+                if not tmp.empty:
+                    # Low threshold (3) to keep 'selected shape' events safe
+                    chunk_dfs.append(tmp.dropna(thresh=3))
+            except Exception as e:
+                print(f"Chunk failed ({after_val[:10]}): {e}")
+
+            current_after_dt = next_before_dt
+
+        df_events = pd.concat(chunk_dfs, ignore_index=True).drop_duplicates()
+
+        p_col = next((c for c in ['playerId', 'player_id', 'player'] if c in df_events.columns), None)
+        if p_col:
+            df_events[p_col] = df_events[p_col].astype(str).str.lstrip('0').replace('', '0')
+
+        # Save the master file
+        df_events.to_csv(events_path, index=False)
+
+        # 2. METADATA SYNTHESIS (The Key to the 56 Subjects)
         game_id = query_params.get('game', [None])[0]
-        if not game_id and 'game_id' in df_events.columns and not df_events.empty:
-            game_id = str(df_events['game_id'].iloc[0])
 
-        game_name = f"Game_{game_id}" if game_id else "Unknown_Game"
-
-        # E. Synthesize games.csv
-        df_games = pd.DataFrame([{'id': game_id, 'name': game_name}])
-        df_games.to_csv(os.path.join(target_directory, "games.csv"), index=False)
-
-        # F. Synthesize players.csv
-        user_col = next((col for col in ['playerId', 'player', 'user_id', 'player_id', 'user'] if
-                         col in df_events.columns), None)
-        if user_col:
-            unique_players = df_events[user_col].unique()
-            df_players = pd.DataFrame({'id': unique_players})
-            df_players['name'] = df_players['id'].apply(lambda x: f"Player_{x}")
-            df_players.to_csv(os.path.join(target_directory, "players.csv"), index=False)
+        # A. Find Version IDs actually present in the data
+        v_col = next((c for c in ['gameVersion', 'version', 'gameVersion_id'] if c in df_events.columns), None)
+        if v_col:
+            actual_versions = df_events[v_col].unique()
+            df_versions = pd.DataFrame({'id': actual_versions, 'game_id': game_id})
         else:
-            pd.DataFrame(columns=['id', 'name']).to_csv(os.path.join(target_directory, "players.csv"),
-                                                        index=False)
-
-        # G. Synthesize game_versions.csv (Crucial for Legacy Support)
-        version_col = next((col for col in ['version', 'gameVersion', 'game_version']
-                            if col in df_events.columns), None)
-
-        if version_col:
-            unique_versions = df_events[version_col].unique()
-            df_versions = pd.DataFrame({'id': unique_versions})
-        else:
-            df_versions = pd.DataFrame({'id': ['1.0']})  # Dummy version
-
-        df_versions['game_id'] = game_id
+            df_versions = pd.DataFrame({'id': ['1.0'], 'game_id': game_id})
         df_versions.to_csv(os.path.join(target_directory, "game_versions.csv"), index=False)
 
-        print(f"Successfully cached data in '{target_directory}'")
+        # B. Find Player IDs actually present in the data
+        # --- Players Synthesis ---
+        p_col = next((c for c in ['playerId', 'player_id', 'player'] if c in df_events.columns), None)
+        if p_col:
+            # 1. Convert to string
+            # 2. Strip leading zeros so '092' becomes '92'
+            # 3. This ensures '092' and '92' are treated as the same person
+            df_events[p_col] = df_events[p_col].astype(str).str.lstrip('0')
 
-        return {
-            "game_name": game_name,
-            "game_id": game_id,
-            "csv_directory": target_directory
-        }
+            unique_p = df_events[p_col].unique()
+            df_players = pd.DataFrame({'id': unique_p})
+            df_players['name'] = df_players['id'].apply(lambda x: f"Player_{x}")
+            df_players.to_csv(os.path.join(target_directory, "players.csv"), index=False)
+
+        # C. Games metadata
+        pd.DataFrame([{'id': game_id, 'name': f"Game_{game_id}"}]).to_csv(
+            os.path.join(target_directory, "games.csv"), index=False)
+
+        print(
+            f"Successfully cached data. Subjects found: {len(unique_p) if p_col else 0}, Versions found: {df_versions['id'].tolist()}")
+
+        return {"game_name": f"Game_{game_id}", "game_id": game_id, "csv_directory": target_directory}
 
     def _load_csv_files(self):
-        """Load all CSV files and normalize columns (Hybrid Approach)"""
-        try:
-            # 1. Load ALL files (Required for Legacy Compatibility)
-            self._events_df = pd.read_csv(self._csv_directory / "events.csv")
-            self._players_df = pd.read_csv(self._csv_directory / "players.csv")
-            self._games_df = pd.read_csv(self._csv_directory / "games.csv")
-            self._game_versions_df = pd.read_csv(self._csv_directory / "game_versions.csv")
+        """Load and normalize columns, specifically fixing the '092' vs '92' issue."""
+        self._events_df = pd.read_csv(self._csv_directory / "events.csv")
+        self._players_df = pd.read_csv(self._csv_directory / "players.csv")
+        self._games_df = pd.read_csv(self._csv_directory / "games.csv")
+        self._game_versions_df = pd.read_csv(self._csv_directory / "game_versions.csv")
 
-            # 2. Normalize Player ID (Required for URL Data)
-            # Nas data has 'player_id', rm1 URL data has 'playerId'
-            if 'player_id' not in self._events_df.columns:
-                found_col = next((col for col in ['playerId', 'player', 'user_id', 'user', 'subject_id']
-                                  if col in self._events_df.columns), None)
+        # Normalize Player ID Column Name
+        if 'player_id' not in self._events_df.columns:
+            p_col = next((c for c in ['playerId', 'player'] if c in self._events_df.columns), None)
+            if p_col:
+                self._events_df.rename(columns={p_col: 'player_id'}, inplace=True)
 
-                if found_col:
-                    if self._config:
-                        print(f"Renaming column '{found_col}' to 'player_id'...")
-                    self._events_df.rename(columns={found_col: 'player_id'}, inplace=True)
+        # --- CRITICAL ID NORMALIZATION ---
+        # Strip leading zeros from all player ID columns in all dataframes
+        for df, col in [(self._events_df, 'player_id'), (self._players_df, 'id')]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.lstrip('0')
+                # Handle the edge case where '000' might become ''
+                df[col] = df[col].replace('', '0')
 
-            # 3. Normalize Game Version ID (Required for URL Data)
-            # Legacy data has 'gameVersion_id', URL data has 'gameVersion'
-            if 'gameVersion_id' not in self._events_df.columns and 'gameVersion' in self._events_df.columns:
-                self._events_df.rename(columns={'gameVersion': 'gameVersion_id'}, inplace=True)
+        # Normalize Version Column Name
+        if 'gameVersion_id' not in self._events_df.columns:
+            v_col = next((c for c in ['gameVersion', 'version'] if c in self._events_df.columns), None)
+            if v_col:
+                self._events_df.rename(columns={v_col: 'gameVersion_id'}, inplace=True)
 
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"Missing CSV file in {self._csv_directory}: {e}")
+        # Ensure version IDs are strings for the filter
+        self._events_df['gameVersion_id'] = self._events_df['gameVersion_id'].astype(str)
+        self._game_versions_df['id'] = self._game_versions_df['id'].astype(str)
 
     def retrieve_data(self, *, verbose: bool = False, after: str = None, before: str = None,
                       event_type: str = None, section: str = None) -> pd.DataFrame:
@@ -237,15 +236,15 @@ class RedMetrics1DataRetriever(DataRetriever):
                               .str.slice(stop=-4) + 'Z'
         return df
 
-    def _format_df(self, *, verbose: Optional[bool] = False) -> pd.DataFrame:
-        """Format the retrieved DataFrame to match expected output format"""
+    def _format_df(self, *, verbose: bool = False) -> pd.DataFrame:
+        """Format the retrieved DataFrame and FORCE player ID normalization."""
         if not self._retrieved_df.empty:
-
             if verbose:
                 print("Formatting dataframe...")
 
+            # 1. Standard RedMetrics 1 Renames
             self._retrieved_df.rename(columns={
-                "gameVersion_id": "gameVersion",  # We assume this col exists in csv or is ignored
+                "gameVersion_id": "gameVersion",
                 "player_id": "playerId",
                 "birthDate": "playerBirthdate",
                 "region": "playerRegion",
@@ -254,17 +253,33 @@ class RedMetrics1DataRetriever(DataRetriever):
                 "externalId": "playerExternalId",
             }, inplace=True)
 
+            # 2. THE ID NORMALIZATION HAMMER
+            # Strip leading zeros so subjects are consistent across all stages.
+            id_cols = ['playerId', 'player_id', 'playerExternalId', 'id']
+            for col in id_cols:
+                if col in self._retrieved_df.columns:
+                    self._retrieved_df[col] = (
+                        self._retrieved_df[col]
+                        .astype(str)
+                        .str.lstrip('0')
+                        .replace('', '0')
+                    )
+
+            # 3. Parse JSON custom data
             if "eventCustomData" in self._retrieved_df.columns:
-                self._retrieved_df = self.parse_json_column(df=self._retrieved_df,
-                                                            column_name="eventCustomData",
-                                                            prefix="customData")
+                self._retrieved_df = self.parse_json_column(
+                    df=self._retrieved_df,
+                    column_name="eventCustomData",
+                    prefix="customData"
+                )
 
-            self._retrieved_df = self.convert_to_iso8601_millis(df=self._retrieved_df,
-                                                                columns=["serverTime", "userTime"])
+            # 4. Standardize Time Format
+            self._retrieved_df = self.convert_to_iso8601_millis(
+                df=self._retrieved_df,
+                columns=["serverTime", "userTime"]
+            )
 
-        # This reindex step is CRITICAL. It ensures that even if 'gameVersion'
-        # is missing from the CSV, the column is created (with NaNs)
-        # so the downstream Parser doesn't crash.
+        # 5. Ensure field order
         self._extra_fields = set(self._retrieved_df.columns) - set(self._config.DOWNLOADER_FIELD_ORDER)
         all_fields = self._config.DOWNLOADER_FIELD_ORDER + tuple(self._extra_fields)
         self._retrieved_df = self._retrieved_df.reindex(columns=all_fields)

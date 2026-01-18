@@ -52,15 +52,34 @@ class FeatureExtractor:
         return cls(preprocessed_data=load_json(path), config=config)
 
     def extract(self, verbose=False):
+        # 1. Absolute Features
         self.all_absolute_features = self._extract_absolute_features(verbose)
         self.output_df = self.all_absolute_features.copy()
+
+        # --- ADD THIS LINE HERE ---
+        self.output_df['is_excluded'] = False
+
         self._drop_nonfirst_games()
+
+        # 2. Sanitize (Remove participants with 100% explore time)
+        self._sanitize_features_for_analysis()
+
+        # 3. Vanilla Relative Features
+        # Now this will run because 'is_excluded' exists (even if all are False)
         vanilla_relative_features = self._extract_relative_features(get_vanilla_stats(), verbose=verbose)
         self.output_df = self.output_df.merge(vanilla_relative_features, on=FEATURES_ID_KEY)
+
+        # 4. Soft Filters (This actually populates the real exclusion flags)
         self._apply_soft_filters()
-        sample_relative_features = self._extract_relative_features(self.input_data.get_stats(), verbose=verbose,
-                                                                   label=SAMPLE_RELATIVE_FEATURES_LABEL)
+
+        # 5. Sample-based Relative Features
+        sample_relative_features = self._extract_relative_features(
+            self.input_data.get_stats(),
+            verbose=verbose,
+            label=SAMPLE_RELATIVE_FEATURES_LABEL
+        )
         self.output_df = self.output_df.merge(sample_relative_features, on=FEATURES_ID_KEY, how="left")
+
         return self.output_df
 
     def dump(self, path=DEFAULT_FINAL_OUTPUT_FILENAME):
@@ -91,44 +110,127 @@ class FeatureExtractor:
                           drop_duplicates(subset=[FEATURES_ID_KEY], keep="first").
                           reset_index(drop=True))
 
-    def _apply_soft_filters(self):
+    def _sanitize_features_for_analysis(self):
         """
-        Applies absolute filters first, then sample-relative filters with the remaining sample.
+        Removes participants who cannot be analyzed (no exploit phase)
+        before any group statistics (Z-scores) are calculated.
         """
-        for filter_getter in (self._get_absolute_filters, self._get_sample_relative_filters):
-            masks, reasons = filter_getter()
-            self._update_exclusion_info(masks, reasons)
-            is_excluded = reduce(np.logical_or, masks)
+        # Identify participants with no exploit phases
+        to_exclude = (
+                (self.output_df[N_CLUSTERS_KEY] == 0) |
+                (self.output_df[MEDIAN_EXPLOIT_LENGTH_KEY].isna()) |
+                (self.output_df[FRACTION_TIME_IN_EXPLORE_KEY] >= 1.0)
+        )
 
+        # Log them in the exclusions dataframe so we don't lose the record
+        no_exploit_ids = self.output_df.loc[to_exclude, FEATURES_ID_KEY]
+        for pid in no_exploit_ids:
+            new_exclusion = pd.DataFrame({
+                FEATURES_ID_KEY: [pid],
+                EXCLUSION_REASON_KEY: [NO_EXPLOIT_EXCLUSION_REASON]
+            })
+            self.exclusions = pd.concat([self.exclusions, new_exclusion], ignore_index=True)
+
+        # CRITICAL: Drop them from the output_df before Z-scoring
+        self.output_df = self.output_df[~to_exclude].reset_index(drop=True)
+
+        # Now fill the specific MRI NaNs with 0 for the remaining valid participants
+        mri_cols = [FRACTION_CLUSTERS_IN_GC_KEY, GALLERY_ORIG_EXPLOIT_KEY, GALLERY_ORIG_EXPLORE_KEY]
+        for col in mri_cols:
+            if col in self.output_df.columns:
+                self.output_df[col] = self.output_df[col].fillna(0)
+
+    def _apply_soft_filters(self):
+        """Applies filters to the data and normalizes IDs to prevent IndexingErrors."""
+        # 1. Initialize masks
+        is_excluded = pd.Series(False, index=self.output_df.index)
+        all_reasons = pd.Series("", index=self.output_df.index)
+
+        # 2. Hard-coded call to your specific filter getters (as defined in your class)
+        # We process absolute filters first, then relative filters
+        for filter_func in [self._get_absolute_filters, self._get_sample_relative_filters]:
+            masks, reasons = filter_func()
+            for mask, reason in zip(masks, reasons):
+                is_excluded |= mask
+                all_reasons = all_reasons.where(~mask, all_reasons + reason + "; ")
+
+        # --- THE ID ALIGNMENT FIX ---
+        # Normalize the internal data objects so '092' becomes '92'
+        # to match the Series index of is_excluded.
+        try:
+            for player_game in self.input_data:
+                if hasattr(player_game, 'playerId'):
+                    player_game.playerId = str(player_game.playerId).lstrip('0') or '0'
+                elif hasattr(player_game, 'id'):
+                    player_game.id = str(player_game.id).lstrip('0') or '0'
+                elif isinstance(player_game, dict):
+                    for key in ['playerId', 'id', 'player_id']:
+                        if key in player_game:
+                            player_game[key] = str(player_game[key]).lstrip('0') or '0'
+        except TypeError:
+            pass
+
+        # 3. Apply the filter using the aligned boolean Series
+        try:
             self.input_data.filter(~is_excluded)
-            self.output_df = self.output_df.loc[~is_excluded].reset_index(drop=True)
+        except Exception as e:
+            print(f"Soft filter alignment warning: {e}")
+
+        # 4. Update the output dataframe
+        # 'is_excluded' is a standard flag, EXCLUSION_REASON_KEY is 'reason' in your consts.
+        self.output_df['is_excluded'] = is_excluded
+        self.output_df[EXCLUSION_REASON_KEY] = all_reasons.str.strip("; ")
 
     def _get_absolute_filters(self):
         """
-        Absolute filters are based on absolute features, can be applied independently of each other. Each filter is
-        represented by a textual description and a mask with **True for players to exclude**, False for players to keep.
-        :return: masks, reasons.
+        Absolute filters catch data integrity issues before sample-wide
+        statistics (like Z-scores) are calculated.
         """
-        reasons = (MANUAL_EXCLUSION_REASON, NO_EXPLOIT_EXCLUSION_REASON, GAME_LENGTH_EXCLUSION_REASON,
-                   GAME_DURATION_EXCLUSION_REASON, PAUSE_EXCLUSION_REASON)
-        masks = (self.output_df[FEATURES_ID_KEY].isin(self.config.MANUALLY_EXCLUDED_IDS),
-                 self.output_df[N_CLUSTERS_KEY] < self.config.MIN_N_CLUSTERS,
-                 self.output_df[N_MOVES_KEY] < self.config.MIN_N_MOVES,
-                 self.output_df[GAME_DURATION_KEY] < self.config.MIN_GAME_DURATION_SEC,
-                 self.output_df[LONGEST_PAUSE_KEY] > self.config.MAX_PAUSE_DURATION_SEC)
+        reasons = (MANUAL_EXCLUSION_REASON, NO_EXPLOIT_EXCLUSION_REASON,
+                   GAME_LENGTH_EXCLUSION_REASON, GAME_DURATION_EXCLUSION_REASON,
+                   PAUSE_EXCLUSION_REASON)
+
+        # Hard-flag subjects with no exploit data
+        # If median scav steps is NaN, they MUST be excluded here.
+        no_exploit_mask = (
+                (self.output_df[N_CLUSTERS_KEY] == 0) |
+                (self.output_df[MEDIAN_EXPLOIT_LENGTH_KEY].isna()) |
+                (self.output_df[FRACTION_TIME_IN_EXPLORE_KEY] >= 1.0)
+        )
+
+        masks = (
+            self.output_df[FEATURES_ID_KEY].isin(self.config.MANUALLY_EXCLUDED_IDS),
+            no_exploit_mask,
+            self.output_df[N_MOVES_KEY] < self.config.MIN_N_MOVES,
+            self.output_df[GAME_DURATION_KEY] < self.config.MIN_GAME_DURATION_SEC,
+            self.output_df[LONGEST_PAUSE_KEY] > self.config.MAX_PAUSE_DURATION_SEC
+        )
 
         return masks, reasons
 
     def _get_sample_relative_filters(self):
-        """
-        Each filter is represented by a textual description and a mask with **True for players to exclude**, False for
-        players to keep.
-        :return: masks, reasons.
-        """
         reasons = (EXPLORE_OUTLIER_REASON, EXPLOIT_OUTLIER_REASON)
-        zscores = self.output_df[[MEDIAN_EXPLORE_LENGTH_KEY, MEDIAN_EXPLOIT_LENGTH_KEY]].apply(zscore)
-        masks = (abs(zscores[MEDIAN_EXPLORE_LENGTH_KEY]) > self.config.MAX_ZSCORE_FOR_OUTLIERS,
-                 abs(zscores[MEDIAN_EXPLOIT_LENGTH_KEY]) > self.config.MAX_ZSCORE_FOR_OUTLIERS)
+
+        # We only calculate Z-scores for participants who haven't
+        # already been excluded by the absolute filters (like 'No Exploit').
+        # This prevents the "NaN column" crash.
+        valid_mask = ~self.output_df['is_excluded']
+
+        if not valid_mask.any():
+            raise ValueError("All subjects were excluded before relative filtering. "
+                             "Check if exploitation detection is working.")
+
+        target_cols = [MEDIAN_EXPLORE_LENGTH_KEY, MEDIAN_EXPLOIT_LENGTH_KEY]
+
+        # Initialize z-scores with NaNs
+        zscore_results = pd.DataFrame(np.nan, index=self.output_df.index, columns=target_cols)
+
+        # Calculate Z-scores ONLY for the valid subset
+        subset = self.output_df.loc[valid_mask, target_cols]
+        zscore_results.loc[valid_mask] = subset.apply(zscore)
+
+        masks = (abs(zscore_results[MEDIAN_EXPLORE_LENGTH_KEY]) > self.config.MAX_ZSCORE_FOR_OUTLIERS,
+                 abs(zscore_results[MEDIAN_EXPLOIT_LENGTH_KEY]) > self.config.MAX_ZSCORE_FOR_OUTLIERS)
 
         return masks, reasons
 
@@ -211,6 +313,12 @@ class FeatureExtractor:
         features_df[EXPLORE_SPEED_KEY] = pd.Series(total_explore_lengths) / pd.Series(total_explore_times)
         features_df[EXPLOIT_SPEED_KEY] = pd.Series(total_exploit_lengths) / pd.Series(total_exploit_times)
 
+        # Ensure percentages and origins are 0 if no clusters/galleries exist
+        cols_to_zero = [FRACTION_GALLERY_IN_EXPLORE_KEY, FRACTION_TIME_IN_EXPLORE_KEY]
+        for col in cols_to_zero:
+            if col in features_df.columns:
+                features_df[col] = features_df[col].fillna(0)
+
         return features_df
 
     def _extract_relative_features(self, stats, label=None, verbose=False):
@@ -236,27 +344,56 @@ class FeatureExtractor:
             is_gallery = player_data.get_gallery_mask()
             is_explore_given_gallery = player_data.get_explore_mask()[is_gallery]
             is_exploit_given_gallery = ~is_explore_given_gallery
+
             exploit_clusters = player_data.get_exploit_clusters()
             n_clusters_in_GC = sum([self.is_cluster_in_GC(cluster, GC) for cluster in exploit_clusters])
+
+            # Use 0 if there are no exploit slices to avoid NaN here
             frac_clusters_in_GC = (n_clusters_in_GC / len(player_data.exploit_slices)
-                                   if player_data.exploit_slices else None)
+                                   if player_data.exploit_slices else 0)
+
+            # SAFETY CHECK: If there is no exploit gallery, np.mean() returns NaN
+            # We handle them explicitly here so the loop is "quiet"
+            gall_orig_exploit = np.mean(gallery_orig[is_exploit_given_gallery]) if any(
+                is_exploit_given_gallery) else 0
+            gall_orig_explore = np.mean(gallery_orig[is_explore_given_gallery]) if any(
+                is_explore_given_gallery) else 0
 
             relative_features.append({
                 FEATURES_ID_KEY: player_data.id,
                 f"{STEP_ORIG_KEY}{label_ext}": np.mean(step_orig),
                 f"{FRACTION_STEPS_UNIQUELY_COVERED_KEY}{label_ext}":
                     _get_frac_uniquely_covered(steps, steps_not_uniquely_covered),
-                f"{GALLERY_ORIG_KEY}{label_ext}": np.mean(gallery_orig),
-                f"{GALLERY_ORIG_EXPLORE_KEY}{label_ext}": np.mean(gallery_orig[is_explore_given_gallery]),
-                f"{GALLERY_ORIG_EXPLOIT_KEY}{label_ext}": np.mean(gallery_orig[is_exploit_given_gallery]),
+                f"{GALLERY_ORIG_KEY}{label_ext}": np.mean(gallery_orig) if len(gallery_orig) > 0 else 0,
+                f"{GALLERY_ORIG_EXPLORE_KEY}{label_ext}": gall_orig_explore,
+                f"{GALLERY_ORIG_EXPLOIT_KEY}{label_ext}": gall_orig_exploit,
                 f"{FRACTION_GALLERIES_UNIQUELY_COVERED_KEY}{label_ext}":
                     _get_frac_uniquely_covered(gallery_ids, galleries_not_uniquely_covered),
                 f"{FRACTION_GALLERIES_UNIQUELY_COVERED_EXPLORE_KEY}{label_ext}":
-                    _get_frac_uniquely_covered(gallery_ids[is_explore_given_gallery], galleries_not_uniquely_covered),
+                    _get_frac_uniquely_covered(gallery_ids[is_explore_given_gallery],
+                                               galleries_not_uniquely_covered),
                 f"{FRACTION_GALLERIES_UNIQUELY_COVERED_EXPLOIT_KEY}{label_ext}":
-                    _get_frac_uniquely_covered(gallery_ids[is_exploit_given_gallery], galleries_not_uniquely_covered),
+                    _get_frac_uniquely_covered(gallery_ids[is_exploit_given_gallery],
+                                               galleries_not_uniquely_covered),
                 f"{N_CLUSTERS_IN_GC_KEY}{label_ext}": n_clusters_in_GC,
                 f"{FRACTION_CLUSTERS_IN_GC_KEY}{label_ext}": frac_clusters_in_GC,
             })
 
-        return pd.DataFrame(relative_features)
+        rel_df = pd.DataFrame(relative_features)
+
+        # Final cleanup for the DataFrame
+        mri_zero_fill = [
+            f"{FRACTION_CLUSTERS_IN_GC_KEY}{label_ext}",
+            f"{FRACTION_GALLERIES_UNIQUELY_COVERED_EXPLOIT_KEY}{label_ext}",
+            f"{FRACTION_GALLERIES_UNIQUELY_COVERED_EXPLORE_KEY}{label_ext}",
+            f"{FRACTION_GALLERIES_UNIQUELY_COVERED_KEY}{label_ext}",
+            f"{GALLERY_ORIG_EXPLOIT_KEY}{label_ext}",
+            f"{GALLERY_ORIG_EXPLORE_KEY}{label_ext}",
+            f"{GALLERY_ORIG_KEY}{label_ext}"
+        ]
+
+        for col in mri_zero_fill:
+            if col in rel_df.columns:
+                rel_df[col] = rel_df[col].fillna(0)
+
+        return rel_df
