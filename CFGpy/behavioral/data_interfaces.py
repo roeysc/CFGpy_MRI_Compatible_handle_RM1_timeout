@@ -182,6 +182,25 @@ class ParsedDataset:
                       to_dict("records"))
         self._reset_state(input_data)
 
+    def keep_only_indices(self, indices_to_keep: list):
+        """
+        Synchronizes the internal input_data list with the filtered DataFrame.
+        This ensures that the feature extraction iterator only processes the
+        specific games we selected (e.g., skipping the false starts).
+        """
+        if isinstance(self.input_data, list):
+            # We filter the list of player-game objects using the provided indices.
+            # We must be careful with indexing if the original list was already
+            # modified, so we use the indices relative to the current list.
+            self.input_data = [self.input_data[i] for i in indices_to_keep if i < len(self.input_data)]
+        else:
+            # If input_data is a DataFrame-like object (rare in this specific pipeline),
+            # we use standard pandas filtering.
+            try:
+                self.input_data = self.input_data.iloc[indices_to_keep].reset_index(drop=True)
+            except AttributeError:
+                print("Warning: input_data type not supported for indexing. Data might be out of sync.")
+
     def filter(self, mask):
         """
         Filters the data.

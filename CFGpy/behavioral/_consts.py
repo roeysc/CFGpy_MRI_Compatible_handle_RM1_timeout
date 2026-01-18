@@ -87,6 +87,7 @@ NO_EXPLOIT_EXCLUSION_REASON = "Did not exploit"
 GAME_LENGTH_EXCLUSION_REASON = "Game length too short"
 GAME_DURATION_EXCLUSION_REASON = "Game duration too short"
 PAUSE_EXCLUSION_REASON = "Paused for too long"
+NO_GALLERY_REASON = "No gallery shapes"
 
 ABSOLUTE_FEATURES_MESSAGE = "Extracting absolute features..."
 RELATIVE_FEATURES_MESSAGE = "Extracting relative{} features..."

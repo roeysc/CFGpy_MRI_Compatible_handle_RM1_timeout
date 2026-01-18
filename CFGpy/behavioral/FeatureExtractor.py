@@ -15,7 +15,7 @@ from CFGpy.behavioral._consts import (FEATURES_ID_KEY, FEATURES_START_TIME_KEY, 
                                       FRACTION_GALLERIES_UNIQUELY_COVERED_EXPLOIT_KEY, N_CLUSTERS_IN_GC_KEY,
                                       ABSOLUTE_FEATURES_MESSAGE, RELATIVE_FEATURES_MESSAGE, EXPLORE_OUTLIER_REASON,
                                       EXPLOIT_OUTLIER_REASON, NO_EXPLOIT_EXCLUSION_REASON, MANUAL_EXCLUSION_REASON,
-                                      GAME_LENGTH_EXCLUSION_REASON, GAME_DURATION_EXCLUSION_REASON,
+                                      GAME_LENGTH_EXCLUSION_REASON, GAME_DURATION_EXCLUSION_REASON, NO_GALLERY_REASON,
                                       PAUSE_EXCLUSION_REASON, SAMPLE_RELATIVE_FEATURES_LABEL,
                                       ROBUST_MEDIAN_PACE_KEY, ROBUST_THRESHOLD_KEY)
 from CFGpy.behavioral import Configuration
@@ -102,13 +102,42 @@ class FeatureExtractor:
 
     def _drop_nonfirst_games(self):
         """
-        Keeps only the first game from each player. Allows functions downstream to assume unique IDs.
+        Selection logic:
+        - If multiple games: if game 1 < 90s, keep game 2.
+        - Otherwise: keep game 1.
         """
-        self.input_data.drop_non_first_games()
-        self.output_df = (self.output_df.
-                          sort_values(by=[FEATURES_START_TIME_KEY], ascending=True).
-                          drop_duplicates(subset=[FEATURES_ID_KEY], keep="first").
-                          reset_index(drop=True))
+        # Ensure we are working with sorted indices
+        all_games = self.all_absolute_features.copy()
+        all_games['original_index'] = all_games.index
+        all_games = all_games.sort_values(by=[FEATURES_ID_KEY, FEATURES_START_TIME_KEY])
+
+        final_indices_to_keep = []
+
+        for pid, group in all_games.groupby(FEATURES_ID_KEY):
+            if len(group) == 1:
+                final_indices_to_keep.append(group['original_index'].iloc[0])
+            else:
+                first_game = group.iloc[0]
+                if first_game[GAME_DURATION_KEY] < 90:
+                    # Log the false start exclusion
+                    new_exclusion = pd.DataFrame({
+                        FEATURES_ID_KEY: [pid],
+                        EXCLUSION_REASON_KEY: [f"False start (<90s, kept game 2 of {len(group)})"]
+                    })
+                    self.exclusions = pd.concat([self.exclusions, new_exclusion], ignore_index=True)
+                    # Use the second game
+                    final_indices_to_keep.append(group['original_index'].iloc[1])
+                else:
+                    # First game was valid
+                    final_indices_to_keep.append(group['original_index'].iloc[0])
+
+        # Filter the DataFrame
+        # We sort by original_index to maintain the order the dataset wrapper expects
+        final_indices_to_keep.sort()
+        self.output_df = self.all_absolute_features.loc[final_indices_to_keep].reset_index(drop=True)
+
+        # Sync the Subject data objects!
+        self.input_data.keep_only_indices(final_indices_to_keep)
 
     def _sanitize_features_for_analysis(self):
         """
@@ -188,7 +217,7 @@ class FeatureExtractor:
         """
         reasons = (MANUAL_EXCLUSION_REASON, NO_EXPLOIT_EXCLUSION_REASON,
                    GAME_LENGTH_EXCLUSION_REASON, GAME_DURATION_EXCLUSION_REASON,
-                   PAUSE_EXCLUSION_REASON)
+                   PAUSE_EXCLUSION_REASON, NO_GALLERY_REASON)
 
         # Hard-flag subjects with no exploit data
         # If median scav steps is NaN, they MUST be excluded here.
@@ -198,12 +227,15 @@ class FeatureExtractor:
                 (self.output_df[FRACTION_TIME_IN_EXPLORE_KEY] >= 1.0)
         )
 
+        no_gallery_mask = (self.output_df[N_GALLERIES_KEY] == 0)
+
         masks = (
             self.output_df[FEATURES_ID_KEY].isin(self.config.MANUALLY_EXCLUDED_IDS),
             no_exploit_mask,
             self.output_df[N_MOVES_KEY] < self.config.MIN_N_MOVES,
             self.output_df[GAME_DURATION_KEY] < self.config.MIN_GAME_DURATION_SEC,
-            self.output_df[LONGEST_PAUSE_KEY] > self.config.MAX_PAUSE_DURATION_SEC
+            self.output_df[LONGEST_PAUSE_KEY] > self.config.MAX_PAUSE_DURATION_SEC,
+            no_gallery_mask
         )
 
         return masks, reasons
