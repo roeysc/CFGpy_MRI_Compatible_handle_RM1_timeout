@@ -21,9 +21,9 @@ class Parser:
         parse_datetime_re_millisecond,
     ]
 
-    def __init__(self, raw_data, config: Configuration = None):
+    def __init__(self, *, raw_data: pd.DataFrame, is_rm1: bool = False, config: Configuration = None):
         self.raw_data = raw_data
-        self.config = config if config is not None else Configuration.default()
+        self.config = config or Configuration.default(is_rm1=is_rm1)
         self.parsed_data = None
 
         self.include_in_id = list(self.config.INCLUDE_IN_PARSER_ID)
@@ -61,17 +61,26 @@ class Parser:
         self.config.to_yaml(path)
 
     def _prepare_data(self):
-        data = self.patchfix_csv_data(self.raw_data)
-        data[self.config.PARSER_JSON_COLUMN] = data[self.config.PARSER_JSON_COLUMN].apply(json.loads)
+        data = self.raw_data
+        data = self.patchfix_csv_data(data)
+        data[self.config.PARSER_JSON_COLUMN] = data[self.config.PARSER_JSON_COLUMN] = data[self.config.PARSER_JSON_COLUMN].apply(
+            lambda x: json.loads(x) if isinstance(x, str) else x
+        )
         all_json_keys = self.get_all_json_keys_from_csv_data(data)
         for key in all_json_keys:
             # Take the json inside the csv file and turn them into columns
             data[key] = data[self.config.PARSER_JSON_COLUMN].apply(lambda json_dict: json_dict.get(key))
 
         data[self.config.SHAPE_MOVE_COLUMN] = data[self.config.SHAPE_MOVE_COLUMN].apply(
-            lambda val: sorted(json.loads(val)) if type(val) is str else np.nan)
+            lambda val: val if isinstance(val, list) 
+            else json.loads(val) if isinstance(val, str) 
+            else np.nan
+            )
         data[self.config.SHAPE_SAVE_COLUMN] = data[self.config.SHAPE_SAVE_COLUMN].apply(
-            lambda val: sorted(json.loads(val)) if type(val) is str else np.nan)
+            lambda val: val if isinstance(val, list) 
+            else json.loads(val) if isinstance(val, str) 
+            else np.nan
+            )
 
         data = self.merge_id_columns(data)
         data[self.config.PARSER_TIME_COLUMN] = pd.to_datetime(data[self.config.PARSER_TIME_COLUMN],
@@ -83,15 +92,19 @@ class Parser:
     def patchfix_csv_data(self, data):
         '''Small patchy bugfix for temporary problems'''
         # Bug no.1 sometimes player external id is this instead of a random number
-        data.loc[data['playerExternalId'] == '${rand://int/100000:10000000}', 'playerExternalId'] = None
+        if 'playerExternalId' in data.columns: # For rm2 this column does not exist
+            data.loc[data['playerExternalId'] == '${rand://int/100000:10000000}', 'playerExternalId'] = None
 
         # Bug no.2 sometimes the endPosition and shape columns switch places
         switched_column_indices = np.flatnonzero(
-            data['customData.endPosition'].apply(lambda x: len(json.loads(x)) == 10 if type(x) is str else False))
+            data['customData.endPosition'].apply(lambda x: len(json.loads(x)) == 10 if (isinstance(x, str) and x.strip()) else False))
         data.loc[switched_column_indices, 'customData.shape'] = data.loc[
             switched_column_indices, 'customData.endPosition']
         data['customData.shape'] = data['customData.shape'].apply(
-            lambda x: json.loads(x) if type(x) is str else []).apply(lambda x: str(x) if len(x) == 10 else np.nan)
+            lambda x: x if isinstance(x, list) 
+            else json.loads(x) if isinstance(x, str) 
+            else []).apply(lambda x: str(x) if len(x) == 10 else np.nan
+        )
 
         return data
 
@@ -114,6 +127,13 @@ class Parser:
         return data
 
     def _apply_hard_filters(self, game):
+        # Get the player ID from the current group (game)
+        # We use iloc[0] because all rows in this group belong to the same player
+        player_id = str(game[self.config.UNIQUE_INTERNAL_ID_COLUMN].iloc[0])
+
+        # Check against the exclusion list from config
+        if player_id in self.config.MANUALLY_EXCLUDED_IDS:
+            return False
         return self.is_game_started(game)
 
     def is_game_started(self, game):
@@ -151,7 +171,7 @@ class Parser:
         game_data[self.config.GALLERY_SAVE_TIME_COLUMN] = None
 
         gallery_save_indices = game_data[self.config.SHAPE_MOVE_COLUMN].isna()[
-            game_data[self.config.SHAPE_MOVE_COLUMN].isna()].index
+            game_data[self.config.SHAPE_MOVE_COLUMN].isna()].index # TODO: retrieves indices of all the None values
         game_data.loc[gallery_save_indices - 1, self.config.GALLERY_SAVE_TIME_COLUMN] = game_data.loc[
             gallery_save_indices, self.config.PARSER_TIME_COLUMN].values
         # Now that we have the save time in all move rows, we can get rid of save rows:

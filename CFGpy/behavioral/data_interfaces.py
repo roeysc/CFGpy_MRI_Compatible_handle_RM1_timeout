@@ -4,10 +4,10 @@ from itertools import pairwise, groupby, combinations
 from collections import Counter
 import networkx as nx
 from CFGpy.behavioral._consts import (PARSED_PLAYER_ID_KEY, PARSED_TIME_KEY, PARSED_ALL_SHAPES_KEY,
-                                      PARSED_CHOSEN_SHAPES_KEY, EXPLORE_KEY, EXPLOIT_KEY)
+                                      PARSED_CHOSEN_SHAPES_KEY, EXPLORE_KEY, EXPLOIT_KEY
+                                      ,ROBUST_MEDIAN_PACE_KEY, ROBUST_THRESHOLD_KEY)
 from CFGpy.behavioral import Configuration
 from CFGpy.behavioral._utils import is_semantic_connection, load_json
-
 
 # TODO: consider: some methods only serve MeasureCalculator, while other are meant as API for end users (e.g.
 #  visualizations). This probably means there's a better way to design these classes
@@ -21,6 +21,15 @@ class ParsedPlayerData:
 
         self.config = config if config is not None else Configuration.default()
         self.delta_move_times = np.diff(self.shapes_df.iloc[:, self.config.SHAPE_MOVE_TIME_IDX])
+
+        # --- [INTEGRATION] MRI METRICS ---
+        # If these keys exist in the dictionary (added by PostParser), expose them as attributes.
+        if ROBUST_MEDIAN_PACE_KEY in player_data:
+            setattr(self, ROBUST_MEDIAN_PACE_KEY, player_data[ROBUST_MEDIAN_PACE_KEY])
+
+        if ROBUST_THRESHOLD_KEY in player_data:
+            setattr(self, ROBUST_THRESHOLD_KEY, player_data[ROBUST_THRESHOLD_KEY])
+
 
     def __len__(self):
         return len(self.shapes_df)
@@ -173,6 +182,25 @@ class ParsedDataset:
                       to_dict("records"))
         self._reset_state(input_data)
 
+    def keep_only_indices(self, indices_to_keep: list):
+        """
+        Synchronizes the internal input_data list with the filtered DataFrame.
+        This ensures that the feature extraction iterator only processes the
+        specific games we selected (e.g., skipping the false starts).
+        """
+        if isinstance(self.input_data, list):
+            # We filter the list of player-game objects using the provided indices.
+            # We must be careful with indexing if the original list was already
+            # modified, so we use the indices relative to the current list.
+            self.input_data = [self.input_data[i] for i in indices_to_keep if i < len(self.input_data)]
+        else:
+            # If input_data is a DataFrame-like object (rare in this specific pipeline),
+            # we use standard pandas filtering.
+            try:
+                self.input_data = self.input_data.iloc[indices_to_keep].reset_index(drop=True)
+            except AttributeError:
+                print("Warning: input_data type not supported for indexing. Data might be out of sync.")
+
     def filter(self, mask):
         """
         Filters the data.
@@ -257,8 +285,12 @@ class PostparsedDataset(ParsedDataset):
         edges = [(c1, c2) for c1, c2 in combinations(exploit_clusters, 2)
                  if is_semantic_connection(c1, c2, self.config.MIN_OVERLAP_FOR_SEMANTIC_CONNECTION)]
         semantic_network.add_edges_from(edges)
-        GC = max(nx.connected_components(semantic_network), key=len)
-
+        connected_components = nx.connected_components(semantic_network)
+        # [FIX] Handle empty graphs (players with no valid moves)
+        try:
+            GC = max(connected_components, key=len)
+        except ValueError:
+            return []
         return GC
 
     def get_stats(self):
